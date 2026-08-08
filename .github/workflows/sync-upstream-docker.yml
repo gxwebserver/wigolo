@@ -1,0 +1,138 @@
+name: Sync Upstream and Publish Docker Image
+
+on:
+  schedule:
+    # Run once a day at 02:17 UTC.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream tag to build (for example: v0.2.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-and-publish
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: https://github.com/KnockOutEZ/wigolo.git
+  IMAGE_NAME: wigolo
+
+jobs:
+  sync-and-select-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.version.outputs.should_build }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream source and tags
+        id: upstream
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --prune upstream \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/upstream/$DEFAULT_BRANCH" \
+            '+refs/tags/*:refs/tags/*'
+
+          git checkout "$DEFAULT_BRANCH"
+          git merge --ff-only "upstream/$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+
+      - name: Select version to build
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = 'workflow_dispatch' ]; then
+            version="$INPUT_VERSION"
+            git rev-parse --verify --quiet "refs/tags/$version" >/dev/null || {
+              echo "::error::Upstream tag $version does not exist."
+              exit 1
+            }
+            should_build=true
+          else
+            # The tag refs present before this run are from the fork. A tag that
+            # only appeared after fetching upstream is new and should be built.
+            latest_tag="$(git ls-remote --tags --refs upstream 'v*' | \
+              awk -F/ '{ print $3 }' | sort -V | tail -n 1)"
+            if [ -z "$latest_tag" ]; then
+              echo '::error::No version tags were found in the upstream repository.'
+              exit 1
+            fi
+
+            version="$latest_tag"
+            # `git fetch` above made every upstream tag available locally. Query
+            # origin directly: the tag is only pushed after the image succeeds,
+            # so a failed build is retried on the following daily run.
+            if git ls-remote --exit-code --tags --refs origin "refs/tags/$version" >/dev/null; then
+              should_build=false
+            else
+              should_build=true
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: sync-and-select-version
+    if: ${{ needs.sync-and-select-version.outputs.should_build == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out selected upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: KnockOutEZ/wigolo
+          ref: ${{ needs.sync-and-select-version.outputs.version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.sync-and-select-version.outputs.version }}
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+  record-upstream-tag:
+    needs:
+      - sync-and-select-version
+      - build-and-push
+    if: ${{ github.event_name == 'schedule' && needs.sync-and-select-version.outputs.should_build == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record the successfully published upstream tag
+        env:
+          VERSION: ${{ needs.sync-and-select-version.outputs.version }}
+        run: |
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch upstream "refs/tags/$VERSION:refs/tags/$VERSION"
+          git push origin "refs/tags/$VERSION"
