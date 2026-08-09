@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Upstream tag to build (for example: v0.2.1)'
+        description: 'Upstream tag or main (for example: v0.2.1 or main)'
         required: true
         type: string
 
@@ -28,6 +28,8 @@ jobs:
     outputs:
       should_build: ${{ steps.version.outputs.should_build }}
       version: ${{ steps.version.outputs.version }}
+      source_ref: ${{ steps.version.outputs.source_ref }}
+      publish_latest: ${{ steps.version.outputs.publish_latest }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -46,7 +48,10 @@ jobs:
             '+refs/tags/*:refs/tags/*'
 
           git checkout "$DEFAULT_BRANCH"
-          git merge --ff-only "upstream/$DEFAULT_BRANCH"
+          # This fork contains its own workflow commits, so upstream is not
+          # necessarily a fast-forward descendant. Merge it without opening an
+          # editor, preserving both the upstream source and local automation.
+          git merge --no-edit "upstream/$DEFAULT_BRANCH"
           git push origin "HEAD:$DEFAULT_BRANCH"
 
       - name: Select version to build
@@ -57,10 +62,21 @@ jobs:
         run: |
           if [ "$EVENT_NAME" = 'workflow_dispatch' ]; then
             version="$INPUT_VERSION"
-            git rev-parse --verify --quiet "refs/tags/$version" >/dev/null || {
-              echo "::error::Upstream tag $version does not exist."
-              exit 1
-            }
+            if [ "$version" = 'main' ]; then
+              git rev-parse --verify --quiet 'refs/remotes/upstream/main' >/dev/null || {
+                echo '::error::The upstream main branch does not exist.'
+                exit 1
+              }
+              source_ref=main
+              publish_latest=false
+            else
+              git rev-parse --verify --quiet "refs/tags/$version" >/dev/null || {
+                echo "::error::Upstream tag $version does not exist. Enter main or a valid upstream tag."
+                exit 1
+              }
+              source_ref="$version"
+              publish_latest=true
+            fi
             should_build=true
           else
             # The tag refs present before this run are from the fork. A tag that
@@ -73,6 +89,8 @@ jobs:
             fi
 
             version="$latest_tag"
+            source_ref="$version"
+            publish_latest=true
             # `git fetch` above made every upstream tag available locally. Query
             # origin directly: the tag is only pushed after the image succeeds,
             # so a failed build is retried on the following daily run.
@@ -84,6 +102,8 @@ jobs:
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
+          echo "publish_latest=$publish_latest" >> "$GITHUB_OUTPUT"
           echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
 
   build-and-push:
@@ -91,11 +111,11 @@ jobs:
     if: ${{ needs.sync-and-select-version.outputs.should_build == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out selected upstream tag
+      - name: Check out selected upstream source
         uses: actions/checkout@v4
         with:
           repository: KnockOutEZ/wigolo
-          ref: ${{ needs.sync-and-select-version.outputs.version }}
+          ref: ${{ needs.sync-and-select-version.outputs.source_ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -114,7 +134,7 @@ jobs:
           push: true
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.sync-and-select-version.outputs.version }}
-            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ needs.sync-and-select-version.outputs.publish_latest == 'true' && format('{0}/{1}:latest', secrets.DOCKER_USERNAME, env.IMAGE_NAME) || '' }}
 
   record-upstream-tag:
     needs:
